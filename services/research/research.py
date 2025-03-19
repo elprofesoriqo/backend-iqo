@@ -286,4 +286,133 @@ async def upload_publication_file(
     
     # Sprawdzanie uprawnień
     if publication["user_id"] != current_user["id"]:
-        raise HTTPException(status_code=403
+        raise HTTPException(status_code=403)# Sprawdzanie uprawnień
+    if publication["user_id"] != current_user["id"]:
+        raise HTTPException(status_code=403, detail="Not authorized to upload file for this publication")
+    
+    # Zapisanie pliku do S3
+    try:
+        file_content = await file.read()
+        file_extension = os.path.splitext(file.filename)[1]
+        file_key = f"publications/{publication_id}/{uuid.uuid4()}{file_extension}"
+        
+        s3_client.upload_fileobj(
+            io.BytesIO(file_content),
+            s3_bucket,
+            file_key,
+            ExtraArgs={"ContentType": file.content_type}
+        )
+        
+        file_url = f"https://{s3_bucket}.s3.amazonaws.com/{file_key}"
+        
+        # Aktualizacja URL pliku w bazie danych
+        await publications_collection.update_one(
+            {"id": publication_id},
+            {"$set": {"file_url": file_url, "updated_at": datetime.utcnow()}}
+        )
+        
+        return {"file_url": file_url}
+    except NoCredentialsError:
+        raise HTTPException(status_code=500, detail="AWS credentials not available")
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=f"Error uploading file: {str(e)}")
+
+@app.get("/search", response_model=List[PublicationSummary])
+async def search_publications(
+    query: str,
+    limit: int = 10,
+    current_user: dict = Depends(get_current_user)
+):
+    # Wyszukiwanie publikacji w bazie danych
+    cursor = publications_collection.find(
+        {"$text": {"$search": query}, "user_id": current_user["id"]}
+    )
+    publications = await cursor.limit(limit).to_list(length=limit)
+    
+    # Jeśli nie znaleziono publikacji lokalnie, przeszukaj Google Scholar
+    if not publications:
+        external_publications = await fetch_publications_from_google_scholar(query, limit)
+        return external_publications
+    
+    return publications
+
+@app.post("/import")
+async def import_from_google_scholar(
+    query: str = Form(...),
+    limit: int = Form(10),
+    current_user: dict = Depends(get_current_user)
+):
+    # Pobieranie publikacji z Google Scholar
+    publications = await fetch_publications_from_google_scholar(query, limit)
+    
+    # Importowanie publikacji do bazy danych
+    for pub in publications:
+        pub_id = str(uuid.uuid4())
+        summary = await generate_summary(pub["abstract"])
+        
+        new_publication = Publication(
+            id=pub_id,
+            title=pub["title"],
+            authors=pub["authors"],
+            abstract=pub["abstract"],
+            publication_date=datetime.fromisoformat(pub["publication_date"]),
+            journal=pub["journal"],
+            doi=pub["doi"],
+            url=pub["url"],
+            summary=summary,
+            visualizations=generate_visualizations(pub),
+            user_id=current_user["id"]
+        )
+        
+        await publications_collection.insert_one(new_publication.dict())
+    
+    return {"message": f"Successfully imported {len(publications)} publications from Google Scholar"}
+
+@app.get("/analytics")
+async def get_analytics(current_user: dict = Depends(get_current_user)):
+    # Agregacja danych do analityki
+    pipeline = [
+        {"$match": {"user_id": current_user["id"]}},
+        {"$group": {
+            "_id": {
+                "year": {"$year": {"$dateFromString": {"dateString": "$publication_date"}}},
+                "month": {"$month": {"$dateFromString": {"dateString": "$publication_date"}}}
+            },
+            "count": {"$sum": 1}
+        }},
+        {"$sort": {"_id.year": 1, "_id.month": 1}}
+    ]
+    
+    result = await publications_collection.aggregate(pipeline).to_list(length=100)
+    
+    # Formatowanie wyników
+    timeline_data = [
+        {
+            "year": item["_id"]["year"],
+            "month": item["_id"]["month"],
+            "count": item["count"]
+        }
+        for item in result
+    ]
+    
+    # Analiza słów kluczowych
+    keywords_pipeline = [
+        {"$match": {"user_id": current_user["id"]}},
+        {"$unwind": "$keywords"},
+        {"$group": {"_id": "$keywords", "count": {"$sum": 1}}},
+        {"$sort": {"count": -1}},
+        {"$limit": 10}
+    ]
+    
+    keywords_result = await publications_collection.aggregate(keywords_pipeline).to_list(length=10)
+    keywords_data = [{"keyword": item["_id"], "count": item["count"]} for item in keywords_result]
+    
+    return {
+        "publication_timeline": timeline_data,
+        "top_keywords": keywords_data,
+        "total_publications": await publications_collection.count_documents({"user_id": current_user["id"]})
+    }
+
+if __name__ == "__main__":
+    import uvicorn
+    uvicorn.run(app, host="0.0.0.0", port=8082)
